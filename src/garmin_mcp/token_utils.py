@@ -4,7 +4,9 @@ import os
 from pathlib import Path
 from typing import Tuple
 
-from garminconnect import Garmin, GarminConnectConnectionError
+from garminconnect import GarminConnectConnectionError
+
+from garmin_mcp.garmin_compat import Garmin
 
 
 def get_token_path() -> str:

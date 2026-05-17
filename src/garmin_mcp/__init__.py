@@ -9,7 +9,8 @@ import base64
 import requests
 from mcp.server.fastmcp import FastMCP
 
-from garminconnect import Garmin, GarminConnectAuthenticationError, GarminConnectConnectionError, GarminConnectTooManyRequestsError
+from garminconnect import GarminConnectAuthenticationError, GarminConnectConnectionError, GarminConnectTooManyRequestsError
+from garmin_mcp.garmin_compat import Garmin
 
 # Import all modules
 from garmin_mcp import activity_management

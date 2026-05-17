@@ -15,6 +15,8 @@ Or skip with: pytest -m "not e2e"
 
 import pytest
 import asyncio
+import os
+import sys
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
@@ -25,6 +27,15 @@ from mcp.client.stdio import stdio_client
 
 # Load environment variables
 load_dotenv()
+
+
+def server_params() -> StdioServerParameters:
+    """Start the server with the same interpreter running the tests."""
+    return StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "garmin_mcp"],
+        env=dict(os.environ),
+    )
 
 
 @pytest.mark.e2e
@@ -39,16 +50,12 @@ async def test_mcp_server_connection():
     - May require MFA code input if tokens are expired
     """
     # Use python module execution instead of direct script path
-    server_params = StdioServerParameters(
-        command="python",
-        args=["-m", "garmin_mcp"],
-        env=None,  # Uses current environment which includes .env variables
-    )
+    params = server_params()
 
     # Connect to server with timeout
     try:
         async with asyncio.timeout(20):  # AsyncIO timeout
-            async with stdio_client(server_params) as (read, write):
+            async with stdio_client(params) as (read, write):
                 async with ClientSession(read, write) as session:
                     # Initialize the connection
                     await session.initialize()
@@ -77,15 +84,11 @@ async def test_mcp_server_connection():
 @pytest.mark.timeout(30)
 async def test_list_activities_tool():
     """Test the list_activities MCP tool with real API"""
-    server_params = StdioServerParameters(
-        command="python",
-        args=["-m", "garmin_mcp"],
-        env=None,
-    )
+    params = server_params()
 
     try:
         async with asyncio.timeout(20):
-            async with stdio_client(server_params) as (read, write):
+            async with stdio_client(params) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
 
@@ -111,15 +114,11 @@ async def test_list_activities_tool():
 @pytest.mark.timeout(30)
 async def test_get_steps_data_tool():
     """Test the get_steps_data MCP tool with real API"""
-    server_params = StdioServerParameters(
-        command="python",
-        args=["-m", "garmin_mcp"],
-        env=None,
-    )
+    params = server_params()
 
     try:
         async with asyncio.timeout(20):
-            async with stdio_client(server_params) as (read, write):
+            async with stdio_client(params) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
 
@@ -147,15 +146,11 @@ async def test_get_steps_data_tool():
 @pytest.mark.timeout(45)
 async def test_multiple_tools():
     """Test multiple MCP tools in a single session"""
-    server_params = StdioServerParameters(
-        command="python",
-        args=["-m", "garmin_mcp"],
-        env=None,
-    )
+    params = server_params()
 
     try:
         async with asyncio.timeout(40):
-            async with stdio_client(server_params) as (read, write):
+            async with stdio_client(params) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
 
@@ -202,11 +197,7 @@ async def test_schedule_workouts_tool():
     import os
     import json
 
-    server_params = StdioServerParameters(
-        command="python",
-        args=["-m", "garmin_mcp"],
-        env=None,
-    )
+    params = server_params()
 
     workout_ids_env = os.environ.get("GARMIN_TEST_WORKOUT_IDS", "")
     dates_env = os.environ.get("GARMIN_TEST_SCHEDULE_DATES", "")
@@ -224,7 +215,7 @@ async def test_schedule_workouts_tool():
 
     try:
         async with asyncio.timeout(50):
-            async with stdio_client(server_params) as (read, write):
+            async with stdio_client(params) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
 

@@ -150,10 +150,12 @@ class TestAuthenticate:
 
     @patch("garmin_mcp.auth_cli.token_exists")
     @patch("garmin_mcp.auth_cli.get_credentials")
+    @patch("garmin_mcp.auth_cli.validate_tokens")
     @patch("garmin_mcp.auth_cli.Garmin")
-    def test_successful_authentication(self, mock_garmin, mock_get_creds, mock_exists):
+    def test_successful_authentication(self, mock_garmin, mock_validate, mock_get_creds, mock_exists):
         """Test successful authentication flow."""
         mock_exists.return_value = False
+        mock_validate.return_value = (True, "")
         mock_get_creds.return_value = ("test@example.com", "secret")
 
         mock_garmin_instance = Mock()
@@ -174,7 +176,7 @@ class TestAuthenticate:
         assert result is True
         mock_garmin_instance.login.assert_called_once()
         mock_garmin_instance.client.dump.assert_called_once_with(tmpdir)
-        mock_garmin_instance.get_full_name.assert_called_once()
+        mock_validate.assert_called_once_with(tmpdir, is_cn=False)
         # Verify base64-encoded token data was written to the base64 file
         m().write.assert_called_once_with(expected_b64)
 
@@ -237,6 +239,22 @@ class TestVerifyTokens:
 
         result = verify_tokens("/test/path")
         assert result is True
+
+    @patch("garmin_mcp.auth_cli.get_token_info")
+    def test_verify_tokens_passes_cn_flag(self, mock_get_info):
+        """Verify mode should validate against garmin.cn when requested."""
+        mock_get_info.return_value = {
+            "path": "/test/path",
+            "expanded_path": "/test/path",
+            "exists": True,
+            "valid": True,
+            "error": ""
+        }
+
+        result = verify_tokens("/test/path", is_cn=True)
+
+        assert result is True
+        mock_get_info.assert_called_once_with("/test/path", is_cn=True)
 
     @patch("garmin_mcp.auth_cli.get_token_info")
     def test_verify_invalid_tokens(self, mock_get_info):
@@ -366,10 +384,12 @@ class TestAuthenticateIsCn:
 
     @patch("garmin_mcp.auth_cli.token_exists")
     @patch("garmin_mcp.auth_cli.get_credentials")
+    @patch("garmin_mcp.auth_cli.validate_tokens")
     @patch("garmin_mcp.auth_cli.Garmin")
-    def test_authenticate_passes_is_cn_true(self, mock_garmin, mock_get_creds, mock_exists):
+    def test_authenticate_passes_is_cn_true(self, mock_garmin, mock_validate, mock_get_creds, mock_exists):
         """Test that is_cn=True is passed to Garmin constructor."""
         mock_exists.return_value = False
+        mock_validate.return_value = (True, "")
         mock_get_creds.return_value = ("test@example.com", "secret")
 
         mock_garmin_instance = Mock()
@@ -383,6 +403,7 @@ class TestAuthenticateIsCn:
                 result = authenticate(tmpdir, f"{tmpdir}/base64", force_reauth=False, is_cn=True)
 
         assert result is True
+        mock_validate.assert_called_once_with(tmpdir, is_cn=True)
         # Verify Garmin was called with is_cn=True
         mock_garmin.assert_called_once_with(
             email="test@example.com",
@@ -394,10 +415,12 @@ class TestAuthenticateIsCn:
 
     @patch("garmin_mcp.auth_cli.token_exists")
     @patch("garmin_mcp.auth_cli.get_credentials")
+    @patch("garmin_mcp.auth_cli.validate_tokens")
     @patch("garmin_mcp.auth_cli.Garmin")
-    def test_authenticate_passes_is_cn_false(self, mock_garmin, mock_get_creds, mock_exists):
+    def test_authenticate_passes_is_cn_false(self, mock_garmin, mock_validate, mock_get_creds, mock_exists):
         """Test that is_cn=False is passed to Garmin constructor by default."""
         mock_exists.return_value = False
+        mock_validate.return_value = (True, "")
         mock_get_creds.return_value = ("test@example.com", "secret")
 
         mock_garmin_instance = Mock()
@@ -411,6 +434,7 @@ class TestAuthenticateIsCn:
                 result = authenticate(tmpdir, f"{tmpdir}/base64", force_reauth=False)
 
         assert result is True
+        mock_validate.assert_called_once_with(tmpdir, is_cn=False)
         # Verify Garmin was called with is_cn=False
         mock_garmin.assert_called_once_with(
             email="test@example.com",

@@ -11,8 +11,9 @@ import getpass
 import base64
 
 import requests
-from garminconnect import Garmin, GarminConnectAuthenticationError, GarminConnectConnectionError, GarminConnectTooManyRequestsError
+from garminconnect import GarminConnectAuthenticationError, GarminConnectConnectionError, GarminConnectTooManyRequestsError
 
+from garmin_mcp.garmin_compat import Garmin
 from garmin_mcp.token_utils import (
     get_token_path,
     get_token_base64_path,
@@ -148,15 +149,17 @@ def authenticate(token_path: str, token_base64_path: str, force_reauth: bool = F
 
         # Verify tokens work
         print("\nVerifying tokens...")
-        try:
-            # Try to get user's full name as a simple verification
-            full_name = garmin.get_full_name()
-            print(f"✓ Authentication successful!")
-            print(f"  Logged in as: {full_name}")
-        except Exception:
-            # Fallback: just confirm tokens were saved
-            print(f"✓ Authentication successful!")
-            print(f"  OAuth tokens saved and ready to use.")
+        is_valid, error_msg = validate_tokens(token_path, is_cn=is_cn)
+        if not is_valid:
+            print(f"✗ Tokens were saved but validation failed: {error_msg}", file=sys.stderr)
+            print(
+                "  The MCP server will not be able to use these tokens until validation passes.",
+                file=sys.stderr,
+            )
+            return False
+
+        print("✓ Authentication successful!")
+        print("  OAuth tokens saved and verified.")
 
         print("\n" + "=" * 60)
         print("SUCCESS: You can now use the Garmin MCP server!")
@@ -230,18 +233,19 @@ def authenticate(token_path: str, token_base64_path: str, force_reauth: bool = F
         return False
 
 
-def verify_tokens(token_path: str) -> bool:
+def verify_tokens(token_path: str, is_cn: bool = False) -> bool:
     """Verify existing tokens are valid.
 
     Args:
         token_path: Path to token directory
+        is_cn: Use Garmin Connect China (garmin.cn) instead of international
 
     Returns:
         bool: True if tokens are valid, False otherwise
     """
     print(f"\nVerifying tokens in '{token_path}'...")
 
-    info = get_token_info(token_path)
+    info = get_token_info(token_path, is_cn=is_cn)
 
     if not info["exists"]:
         print(f"✗ Tokens not found at: {info['expanded_path']}")
@@ -329,7 +333,7 @@ Examples:
 
     # Verify mode
     if args.verify:
-        success = verify_tokens(token_path)
+        success = verify_tokens(token_path, is_cn=is_cn)
         sys.exit(0 if success else 1)
 
     # Authenticate mode
