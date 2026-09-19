@@ -3,9 +3,14 @@ Integration tests for activity_analysis module MCP tools
 
 Tests the get_activity_fit_data tool using mocked Garmin API and fitparse responses.
 """
+import io
 import json
+import os
+import zipfile
 import pytest
 from unittest.mock import Mock, patch, MagicMock
+from fitparse.profile import MESSAGE_TYPES
+from fitparse.records import DataMessage, FieldData
 from mcp.server.fastmcp import FastMCP
 
 from garmin_mcp import activity_analysis
@@ -16,6 +21,7 @@ from garmin_mcp.activity_analysis import (
     _compute_temperature_stats,
     _grade_analysis,
     _compute_shift_summary,
+    _compute_hrv_metrics,
 )
 
 
@@ -46,9 +52,323 @@ def _mock_fitfile(messages):
     return mock_ff
 
 
+def _make_generic_fit_message(name, fields, global_message_number=None):
+    """Create a message with real FieldData-like objects for generic parsing."""
+    message = Mock()
+    message.name = name
+    message.fields = []
+    if global_message_number is not None:
+        message.mesg_num = global_message_number
+    else:
+        del message.mesg_num
+
+    for definition_number, field_name, value, units in fields:
+        field = Mock()
+        field.name = field_name
+        field.value = value
+        field.units = units
+        field.field_def = Mock(def_num=definition_number)
+        if field_name == "category":
+            field.type = activity_analysis.FIT_FIELD_TYPES["exercise_category"]
+        else:
+            del field.type
+        del field.raw_value
+        message.fields.append(field)
+    return message
+
+
+def _make_profile_fit_message(message_number, fields):
+    """Create a DataMessage with the actual fitparse profile field objects."""
+    message_type = MESSAGE_TYPES[message_number]
+    field_data = [
+        FieldData(
+            field_def=None,
+            field=message_type.fields[definition_number],
+            parent_field=None,
+            value=value,
+            raw_value=raw_value,
+        )
+        for definition_number, value, raw_value in fields
+    ]
+    return DataMessage(header=None, def_mesg=message_type, fields=field_data)
+
+
 # ---------------------------------------------------------------------------
 # Basic tool behaviour
 # ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_get_activity_fit_messages_preserves_all_message_types_and_fields(
+    app_with_activity_analysis, mock_garmin_client
+):
+    """Generic FIT tool does not discard strength or unknown FIT fields."""
+    from garminconnect import Garmin
+
+    mock_garmin_client.download_activity.return_value = b"\x00" * 20
+    exercise_title = _make_generic_fit_message(
+        "exercise_title",
+        [
+            (254, "message_index", 0, None),
+            (0, "exercise_category", "bench_press", None),
+            (1, "exercise_name", "barbell_bench_press", None),
+        ],
+        global_message_number=264,
+    )
+    set_message = _make_generic_fit_message(
+        "set",
+        [
+            (3, "repetitions", 8, "repetitions"),
+            (4, "weight", 61.2349, "kg"),
+            (7, "category", [8, 21], None),
+            (8, "category_subtype", [0, None], None),
+            (5, "set_type", "active", None),
+            (99, "unknown_99", b"\x01\x02", None),
+        ],
+        global_message_number=225,
+    )
+
+    with patch("garmin_mcp.activity_analysis.fitparse") as mock_fp:
+        mock_fp.FitFile.return_value = _mock_fitfile([exercise_title, set_message])
+        result = await app_with_activity_analysis.call_tool(
+            "get_activity_fit_messages", {"activity_id": ACTIVITY_ID}
+        )
+
+    mock_garmin_client.download_activity.assert_called_once_with(
+        ACTIVITY_ID,
+        dl_fmt=Garmin.ActivityDownloadFormat.ORIGINAL,
+    )
+    data = json.loads(result[0][0].text)
+    assert data["source"] == "garmin_original_fit"
+    assert data["message_counts"] == {"exercise_title": 1, "set": 1}
+    assert [message["type"] for message in data["messages"]] == [
+        "exercise_title", "set"
+    ]
+    assert data["messages"][0]["global_message_number"] == 264
+    assert data["messages"][1]["fields"] == [
+        {
+            "name": "repetitions",
+            "value": 8,
+            "units": "repetitions",
+            "definition_number": 3,
+        },
+        {
+            "name": "weight",
+            "value": 61.2349,
+            "units": "kg",
+            "definition_number": 4,
+        },
+        {
+            "name": "category",
+            "value": [8, 21],
+            "definition_number": 7,
+            "profile_type": "exercise_category",
+            "value_names": ["deadlift", "pull_up"],
+        },
+        {
+            "name": "category_subtype",
+            "value": [0, None],
+            "definition_number": 8,
+            "value_names": ["barbell_deadlift", None],
+        },
+        {"name": "set_type", "value": "active", "definition_number": 5},
+        {
+            "name": "unknown_99",
+            "value": {"encoding": "hex", "value": "0102"},
+            "definition_number": 99,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_activity_fit_messages_resolves_standard_contextual_enums(
+    app_with_activity_analysis, mock_garmin_client
+):
+    """Real fitparse fields retain labels for context-dependent FIT enums."""
+    mock_garmin_client.download_activity.return_value = b"\x00" * 20
+    messages = [
+        _make_profile_fit_message(
+            225,
+            [
+                (7, "squat", 28),
+                (8, 6, 6),
+            ],
+        ),
+        _make_profile_fit_message(
+            264,
+            [
+                (0, "squat", 28),
+                (1, 6, 6),
+            ],
+        ),
+    ]
+
+    with patch("garmin_mcp.activity_analysis.fitparse") as mock_fp:
+        mock_fp.FitFile.return_value = _mock_fitfile(messages)
+        result = await app_with_activity_analysis.call_tool(
+            "get_activity_fit_messages", {"activity_id": ACTIVITY_ID}
+        )
+
+    data = json.loads(result[0][0].text)
+    fields_by_message = [
+        {field["name"]: field for field in message["fields"]}
+        for message in data["messages"]
+    ]
+    assert fields_by_message[0]["category"]["value_name"] == "squat"
+    assert (
+        fields_by_message[0]["category_subtype"]["value_name"]
+        == "barbell_back_squat"
+    )
+    assert (
+        fields_by_message[1]["exercise_name"]["value_name"]
+        == "barbell_back_squat"
+    )
+    assert fields_by_message[1]["exercise_name"]["raw_value"] == 6
+
+
+@pytest.mark.asyncio
+async def test_get_activity_fit_messages_omits_records_by_default(
+    app_with_activity_analysis, mock_garmin_client
+):
+    """Record messages are inventoried but do not inflate the default result."""
+    mock_garmin_client.download_activity.return_value = b"\x00" * 20
+    messages = [
+        _make_generic_fit_message("record", [(3, "heart_rate", 140, "bpm")]),
+        _make_generic_fit_message("set", [(3, "repetitions", 10, "repetitions")]),
+        _make_generic_fit_message("record", [(3, "heart_rate", 141, "bpm")]),
+    ]
+
+    with patch("garmin_mcp.activity_analysis.fitparse") as mock_fp:
+        mock_fp.FitFile.return_value = _mock_fitfile(messages)
+        result = await app_with_activity_analysis.call_tool(
+            "get_activity_fit_messages", {"activity_id": ACTIVITY_ID}
+        )
+
+    data = json.loads(result[0][0].text)
+    assert data["message_counts"] == {"record": 2, "set": 1}
+    assert data["returned_message_counts"] == {"set": 1}
+    assert [message["type"] for message in data["messages"]] == ["set"]
+    assert data["record_stream"]["included"] is False
+    assert data["record_stream"]["total_count"] == 2
+    assert data["record_stream"]["returned_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_get_activity_fit_messages_paginates_records(
+    app_with_activity_analysis, mock_garmin_client
+):
+    """Callers can walk a large record stream in bounded pages."""
+    mock_garmin_client.download_activity.return_value = b"\x00" * 20
+    messages = [
+        _make_generic_fit_message("record", [(3, "heart_rate", bpm, "bpm")])
+        for bpm in (140, 141, 142)
+    ]
+
+    with patch("garmin_mcp.activity_analysis.fitparse") as mock_fp, patch(
+        "garmin_mcp.activity_analysis._serialize_fit_field",
+        wraps=activity_analysis._serialize_fit_field,
+    ) as serialize_field:
+        mock_fp.FitFile.return_value = _mock_fitfile(messages)
+        result = await app_with_activity_analysis.call_tool(
+            "get_activity_fit_messages",
+            {
+                "activity_id": ACTIVITY_ID,
+                "include_records": True,
+                "message_offset": 1,
+                "message_limit": 1,
+            },
+        )
+
+    data = json.loads(result[0][0].text)
+    assert data["record_stream"] == {
+        "included": True,
+        "total_count": 3,
+        "returned_count": 1,
+    }
+    assert data["pagination"] == {
+        "total_eligible_count": 3,
+        "returned_count": 1,
+        "offset": 1,
+        "limit": 1,
+        "next_offset": 2,
+    }
+    assert data["messages"][0]["type_index"] == 1
+    assert data["messages"][0]["fields"][0]["value"] == 141
+    assert serialize_field.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_get_activity_fit_messages_filters_returned_types_but_keeps_inventory(
+    app_with_activity_analysis, mock_garmin_client
+):
+    """message_types narrows output without hiding what the FIT file contains."""
+    mock_garmin_client.download_activity.return_value = b"\x00" * 20
+    messages = [
+        _make_generic_fit_message("session", [(5, "sport", "training", None)]),
+        _make_generic_fit_message("set", [(3, "repetitions", 5, "repetitions")]),
+    ]
+
+    with patch("garmin_mcp.activity_analysis.fitparse") as mock_fp:
+        mock_fp.FitFile.return_value = _mock_fitfile(messages)
+        result = await app_with_activity_analysis.call_tool(
+            "get_activity_fit_messages",
+            {"activity_id": ACTIVITY_ID, "message_types": ["SET"]},
+        )
+
+    data = json.loads(result[0][0].text)
+    assert data["message_counts"] == {"session": 1, "set": 1}
+    assert data["returned_message_counts"] == {"set": 1}
+    assert [message["type"] for message in data["messages"]] == ["set"]
+
+
+@pytest.mark.asyncio
+async def test_get_activity_fit_messages_rejects_unbounded_message_limit(
+    app_with_activity_analysis, mock_garmin_client
+):
+    """Message pages have a hard maximum to protect MCP response size."""
+    mock_garmin_client.download_activity.return_value = b"\x00" * 20
+
+    with patch("garmin_mcp.activity_analysis.fitparse") as mock_fp:
+        mock_fp.FitFile.return_value = _mock_fitfile([])
+        result = await app_with_activity_analysis.call_tool(
+            "get_activity_fit_messages",
+            {
+                "activity_id": ACTIVITY_ID,
+                "include_records": True,
+                "message_limit": 5001,
+            },
+        )
+
+    data = json.loads(result[0][0].text)
+    assert data["error"] == "message_limit must be between 1 and 5000"
+
+
+@pytest.mark.asyncio
+async def test_get_activity_fit_messages_omits_other_high_frequency_types_by_default(
+    app_with_activity_analysis, mock_garmin_client
+):
+    """Unknown vendor sample streams cannot inflate an unfiltered response."""
+    mock_garmin_client.download_activity.return_value = b"\x00" * 20
+    messages = [
+        _make_generic_fit_message("session", [(5, "sport", "training", None)])
+    ] + [
+        _make_generic_fit_message("unknown_233", [(0, "unknown_0", index, None)])
+        for index in range(101)
+    ]
+
+    with patch("garmin_mcp.activity_analysis.fitparse") as mock_fp, patch(
+        "garmin_mcp.activity_analysis._serialize_fit_field",
+        wraps=activity_analysis._serialize_fit_field,
+    ) as serialize_field:
+        mock_fp.FitFile.return_value = _mock_fitfile(messages)
+        result = await app_with_activity_analysis.call_tool(
+            "get_activity_fit_messages", {"activity_id": ACTIVITY_ID}
+        )
+
+    data = json.loads(result[0][0].text)
+    assert [message["type"] for message in data["messages"]] == ["session"]
+    assert data["message_counts"]["unknown_233"] == 101
+    assert data["omitted_high_frequency_message_types"]["unknown_233"]["count"] == 101
+    assert serialize_field.call_count == 1
 
 @pytest.mark.asyncio
 async def test_get_activity_fit_data_calls_download(app_with_activity_analysis, mock_garmin_client):
@@ -670,3 +990,447 @@ def test_grade_analysis_bins_correctly():
     assert "descending" in result
     # Steeper terrain should have higher avg power
     assert result["gentle"]["avg_power_w"] < result["moderate"]["avg_power_w"]
+
+
+# ---------------------------------------------------------------------------
+# HRV metrics (unit tests for _compute_hrv_metrics)
+# ---------------------------------------------------------------------------
+
+def test_compute_hrv_metrics_returns_none_below_minimum():
+    """Returns None when fewer than 10 R-R intervals."""
+    assert _compute_hrv_metrics([0.6] * 9) is None
+
+
+def test_compute_hrv_metrics_correct_values():
+    """Computes correct RMSSD, SDNN, pNN50, mean_rr for known input.
+
+    20 alternating 600/700 ms R-R intervals (in seconds):
+      mean_rr  = 650.0 ms
+      RMSSD    = sqrt(10000) = 100.0 ms      (all successive diffs = ±100 ms)
+      SDNN     = sqrt(50000/19) ≈ 51.3 ms   (sample SD)
+      pNN50    = 100.0 %                     (all |diffs| = 100 ms > 50 ms)
+      mean_hr  = round(60000/650, 1) = 92.3 bpm
+    """
+    rr_s = [0.6, 0.7] * 10
+    result = _compute_hrv_metrics(rr_s)
+    assert result is not None
+    assert result["rmssd_ms"] == 100.0
+    assert result["sdnn_ms"] == 51.3
+    assert result["pnn50_pct"] == 100.0
+    assert result["mean_rr_ms"] == 650.0
+    assert result["mean_hr_bpm"] == 92.3
+    assert result["rr_count"] == 20
+
+
+def test_compute_hrv_metrics_pnn50_zero_when_no_large_diffs():
+    """pNN50 is 0 when all successive differences are <= 50 ms."""
+    rr_s = [0.6] * 20
+    result = _compute_hrv_metrics(rr_s)
+    assert result is not None
+    assert result["pnn50_pct"] == 0.0
+    assert result["rmssd_ms"] == 0.0
+    assert result["sdnn_ms"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# HRV from FIT (integration tests through the tool)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_fit_no_hrv_messages_produces_no_hrv_key(app_with_activity_analysis, mock_garmin_client):
+    """Activities without hrv messages produce no hrv key (backwards compat)."""
+    mock_garmin_client.download_activity.return_value = b"\x00" * 20
+    record_msg = _make_mock_fit_message("record", {"heart_rate": 140})
+
+    with patch("garmin_mcp.activity_analysis.fitparse") as mock_fp:
+        mock_fp.FitFile.return_value = _mock_fitfile([record_msg])
+        result = await app_with_activity_analysis.call_tool(
+            "get_activity_fit_data", {"activity_id": ACTIVITY_ID}
+        )
+
+    data = json.loads(result[0][0].text)
+    assert "hrv" not in data
+
+
+@pytest.mark.asyncio
+async def test_fit_hrv_summary_present_with_enough_intervals(app_with_activity_analysis, mock_garmin_client):
+    """hrv summary key appears with correct structure when >= 10 valid R-R intervals exist."""
+    mock_garmin_client.download_activity.return_value = b"\x00" * 20
+    record_msg = _make_mock_fit_message("record", {"timestamp": "2026-05-15 10:00:00"})
+    hrv_msg = _make_mock_fit_message("hrv", {"time": [0.6, 0.7] * 10})
+
+    with patch("garmin_mcp.activity_analysis.fitparse") as mock_fp:
+        mock_fp.FitFile.return_value = _mock_fitfile([record_msg, hrv_msg])
+        result = await app_with_activity_analysis.call_tool(
+            "get_activity_fit_data", {"activity_id": ACTIVITY_ID}
+        )
+
+    data = json.loads(result[0][0].text)
+    assert "hrv" in data
+    hrv = data["hrv"]
+    assert "rmssd_ms" in hrv
+    assert "sdnn_ms" in hrv
+    assert "pnn50_pct" in hrv
+    assert "mean_rr_ms" in hrv
+    assert "rr_count" in hrv
+    assert hrv["rr_count"] == 20
+
+
+@pytest.mark.asyncio
+async def test_fit_hrv_sentinel_values_filtered(app_with_activity_analysis, mock_garmin_client):
+    """FIT sentinel values (~65.535 s) are excluded from HRV computation."""
+    mock_garmin_client.download_activity.return_value = b"\x00" * 20
+    record_msg = _make_mock_fit_message("record", {"timestamp": "2026-05-15 10:00:00"})
+    hrv_msg = _make_mock_fit_message("hrv", {"time": [0.6] * 20 + [65.535] * 5})
+
+    with patch("garmin_mcp.activity_analysis.fitparse") as mock_fp:
+        mock_fp.FitFile.return_value = _mock_fitfile([record_msg, hrv_msg])
+        result = await app_with_activity_analysis.call_tool(
+            "get_activity_fit_data", {"activity_id": ACTIVITY_ID}
+        )
+
+    data = json.loads(result[0][0].text)
+    assert "hrv" in data
+    assert data["hrv"]["rr_count"] == 20
+
+
+@pytest.mark.asyncio
+async def test_fit_hrv_not_produced_below_minimum_samples(app_with_activity_analysis, mock_garmin_client):
+    """No hrv key when fewer than 10 valid R-R intervals are present."""
+    mock_garmin_client.download_activity.return_value = b"\x00" * 20
+    record_msg = _make_mock_fit_message("record", {"timestamp": "2026-05-15 10:00:00"})
+    hrv_msg = _make_mock_fit_message("hrv", {"time": [0.6] * 9})
+
+    with patch("garmin_mcp.activity_analysis.fitparse") as mock_fp:
+        mock_fp.FitFile.return_value = _mock_fitfile([record_msg, hrv_msg])
+        result = await app_with_activity_analysis.call_tool(
+            "get_activity_fit_data", {"activity_id": ACTIVITY_ID}
+        )
+
+    data = json.loads(result[0][0].text)
+    assert "hrv" not in data
+
+
+@pytest.mark.asyncio
+async def test_fit_hrv_rr_intervals_excluded_by_default(app_with_activity_analysis, mock_garmin_client):
+    """Raw rr_intervals_seconds is absent when include_records is not set."""
+    mock_garmin_client.download_activity.return_value = b"\x00" * 20
+    record_msg = _make_mock_fit_message("record", {"timestamp": "2026-05-15 10:00:00"})
+    hrv_msg = _make_mock_fit_message("hrv", {"time": [0.65] * 20})
+
+    with patch("garmin_mcp.activity_analysis.fitparse") as mock_fp:
+        mock_fp.FitFile.return_value = _mock_fitfile([record_msg, hrv_msg])
+        result = await app_with_activity_analysis.call_tool(
+            "get_activity_fit_data", {"activity_id": ACTIVITY_ID}
+        )
+
+    data = json.loads(result[0][0].text)
+    assert "rr_intervals_seconds" not in data
+    assert "hrv" in data  # summary is still present
+
+
+@pytest.mark.asyncio
+async def test_fit_hrv_rr_intervals_included_when_records_requested(app_with_activity_analysis, mock_garmin_client):
+    """Raw rr_intervals_seconds appears when include_records=True."""
+    mock_garmin_client.download_activity.return_value = b"\x00" * 20
+    messages = [
+        _make_mock_fit_message("record", {"timestamp": "2026-05-15 10:00:00"}),
+        _make_mock_fit_message("hrv", {"time": [0.65] * 20}),
+    ]
+
+    with patch("garmin_mcp.activity_analysis.fitparse") as mock_fp:
+        # side_effect returns a fresh iterator on each FitFile() call
+        mock_ff = MagicMock()
+        mock_ff.get_messages.side_effect = lambda: iter(messages)
+        mock_fp.FitFile.return_value = mock_ff
+        result = await app_with_activity_analysis.call_tool(
+            "get_activity_fit_data",
+            {"activity_id": ACTIVITY_ID, "include_records": True}
+        )
+
+    data = json.loads(result[0][0].text)
+    assert "rr_intervals_seconds" in data
+    assert len(data["rr_intervals_seconds"]) == 20
+    assert data["rr_intervals_seconds"][0]["rr_seconds"] == 0.65
+
+
+@pytest.mark.asyncio
+async def test_fit_hrv_per_lap_bucketing(app_with_activity_analysis, mock_garmin_client):
+    """Per-lap HRV is computed by bucketing R-R pairs into each lap's time window."""
+    mock_garmin_client.download_activity.return_value = b"\x00" * 20
+
+    # Record + HRV inside lap 1's window (10:00–10:10)
+    record_lap1 = _make_mock_fit_message("record", {"timestamp": "2026-05-15 10:05:00"})
+    hrv_lap1 = _make_mock_fit_message("hrv", {"time": [0.6, 0.7] * 10})
+
+    # Record + HRV inside lap 2's window (10:10–10:20)
+    record_lap2 = _make_mock_fit_message("record", {"timestamp": "2026-05-15 10:15:00"})
+    hrv_lap2 = _make_mock_fit_message("hrv", {"time": [0.6, 0.7] * 10})
+
+    lap1_msg = _make_mock_fit_message("lap", {
+        "start_time": "2026-05-15 10:00:00",
+        "total_elapsed_time": 600.0,
+    })
+    lap2_msg = _make_mock_fit_message("lap", {
+        "start_time": "2026-05-15 10:10:00",
+        "total_elapsed_time": 600.0,
+    })
+
+    with patch("garmin_mcp.activity_analysis.fitparse") as mock_fp:
+        mock_fp.FitFile.return_value = _mock_fitfile([
+            record_lap1, hrv_lap1,
+            record_lap2, hrv_lap2,
+            lap1_msg, lap2_msg,
+        ])
+        result = await app_with_activity_analysis.call_tool(
+            "get_activity_fit_data", {"activity_id": ACTIVITY_ID}
+        )
+
+    data = json.loads(result[0][0].text)
+    assert len(data["laps"]) == 2
+    assert "hrv" in data["laps"][0], "Lap 1 should have HRV"
+    assert "hrv" in data["laps"][1], "Lap 2 should have HRV"
+    assert data["laps"][0]["hrv"]["rr_count"] == 20
+    assert data["laps"][1]["hrv"]["rr_count"] == 20
+
+
+@pytest.mark.asyncio
+async def test_fit_hrv_lap_below_minimum_gets_no_hrv(app_with_activity_analysis, mock_garmin_client):
+    """A lap with fewer than 10 R-R intervals in its window gets no hrv key."""
+    mock_garmin_client.download_activity.return_value = b"\x00" * 20
+
+    record_lap1 = _make_mock_fit_message("record", {"timestamp": "2026-05-15 10:05:00"})
+    hrv_lap1 = _make_mock_fit_message("hrv", {"time": [0.6, 0.7] * 10})  # 20 → hrv
+
+    record_lap2 = _make_mock_fit_message("record", {"timestamp": "2026-05-15 10:15:00"})
+    hrv_lap2 = _make_mock_fit_message("hrv", {"time": [0.6] * 5})  # 5 → no hrv
+
+    lap1_msg = _make_mock_fit_message("lap", {
+        "start_time": "2026-05-15 10:00:00",
+        "total_elapsed_time": 600.0,
+    })
+    lap2_msg = _make_mock_fit_message("lap", {
+        "start_time": "2026-05-15 10:10:00",
+        "total_elapsed_time": 600.0,
+    })
+
+    with patch("garmin_mcp.activity_analysis.fitparse") as mock_fp:
+        mock_fp.FitFile.return_value = _mock_fitfile([
+            record_lap1, hrv_lap1,
+            record_lap2, hrv_lap2,
+            lap1_msg, lap2_msg,
+        ])
+        result = await app_with_activity_analysis.call_tool(
+            "get_activity_fit_data", {"activity_id": ACTIVITY_ID}
+        )
+
+    data = json.loads(result[0][0].text)
+    assert len(data["laps"]) == 2
+    assert "hrv" in data["laps"][0]
+    assert "hrv" not in data["laps"][1]
+
+
+# ---------------------------------------------------------------------------
+# Download config / directory resolution helpers
+# ---------------------------------------------------------------------------
+
+def test_resolve_download_dir_prefers_output_dir_arg(monkeypatch, tmp_path):
+    monkeypatch.setenv("GARMIN_FIT_DOWNLOAD_DIR", str(tmp_path / "env"))
+    monkeypatch.setenv("GARMIN_FIT_CONFIG", str(tmp_path / "fit_config.json"))
+    activity_analysis._write_fit_config(str(tmp_path / "cfg"))
+    result = activity_analysis._resolve_download_dir(str(tmp_path / "arg"))
+    assert result == os.path.abspath(str(tmp_path / "arg"))
+
+
+def test_resolve_download_dir_uses_env_var(monkeypatch, tmp_path):
+    monkeypatch.setenv("GARMIN_FIT_DOWNLOAD_DIR", str(tmp_path / "env"))
+    result = activity_analysis._resolve_download_dir(None)
+    assert result == os.path.abspath(str(tmp_path / "env"))
+
+
+def test_resolve_download_dir_uses_config_file(monkeypatch, tmp_path):
+    monkeypatch.delenv("GARMIN_FIT_DOWNLOAD_DIR", raising=False)
+    monkeypatch.setenv("GARMIN_FIT_CONFIG", str(tmp_path / "fit_config.json"))
+    activity_analysis._write_fit_config(str(tmp_path / "saved"))
+    result = activity_analysis._resolve_download_dir(None)
+    assert result == os.path.abspath(str(tmp_path / "saved"))
+
+
+def test_resolve_download_dir_returns_none_when_unconfigured(monkeypatch, tmp_path):
+    monkeypatch.delenv("GARMIN_FIT_DOWNLOAD_DIR", raising=False)
+    monkeypatch.setenv("GARMIN_FIT_CONFIG", str(tmp_path / "missing.json"))
+    assert activity_analysis._resolve_download_dir(None) is None
+
+
+def test_read_fit_config_missing_returns_empty(monkeypatch, tmp_path):
+    monkeypatch.setenv("GARMIN_FIT_CONFIG", str(tmp_path / "missing.json"))
+    assert activity_analysis._read_fit_config() == {}
+
+
+def test_resolve_download_dir_config_missing_key_returns_none(monkeypatch, tmp_path):
+    monkeypatch.delenv("GARMIN_FIT_DOWNLOAD_DIR", raising=False)
+    cfg = tmp_path / "cfg.json"
+    monkeypatch.setenv("GARMIN_FIT_CONFIG", str(cfg))
+    cfg.write_text('{"other": "value"}')
+    assert activity_analysis._resolve_download_dir(None) is None
+
+
+def test_read_fit_config_non_dict_returns_empty(monkeypatch, tmp_path):
+    cfg = tmp_path / "cfg.json"
+    monkeypatch.setenv("GARMIN_FIT_CONFIG", str(cfg))
+    cfg.write_text("[1, 2, 3]")
+    assert activity_analysis._read_fit_config() == {}
+
+
+# ---------------------------------------------------------------------------
+# set_fit_download_dir tool
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_set_fit_download_dir_persists(app_with_activity_analysis, monkeypatch, tmp_path):
+    cfg = tmp_path / "fit_config.json"
+    monkeypatch.setenv("GARMIN_FIT_CONFIG", str(cfg))
+    target = tmp_path / "downloads"
+
+    result = await app_with_activity_analysis.call_tool(
+        "set_fit_download_dir", {"path": str(target)}
+    )
+    data = json.loads(result[0][0].text)
+
+    assert data["download_dir"] == os.path.abspath(str(target))
+    assert os.path.isdir(str(target))  # directory was created
+    assert json.loads(cfg.read_text())["download_dir"] == os.path.abspath(str(target))
+
+
+# ---------------------------------------------------------------------------
+# download_activity_file tool
+# ---------------------------------------------------------------------------
+
+def _make_fit_zip(fit_bytes: bytes) -> bytes:
+    """Build an in-memory ZIP containing a single .fit file (as Garmin returns)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("activity.fit", fit_bytes)
+    return buf.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_download_activity_file_fit_saves_file(
+    app_with_activity_analysis, mock_garmin_client, tmp_path
+):
+    from garminconnect import Garmin
+
+    fit_bytes = b"\x0e\x10FITDATA"
+    mock_garmin_client.download_activity.return_value = _make_fit_zip(fit_bytes)
+
+    result = await app_with_activity_analysis.call_tool(
+        "download_activity_file",
+        {"activity_id": ACTIVITY_ID, "output_dir": str(tmp_path)},
+    )
+    data = json.loads(result[0][0].text)
+
+    expected = tmp_path / f"{ACTIVITY_ID}.fit"
+    assert expected.read_bytes() == fit_bytes
+    assert data["file_path"] == os.path.abspath(str(expected))
+    assert data["format"] == "fit"
+    assert data["size_bytes"] == len(fit_bytes)
+    mock_garmin_client.download_activity.assert_called_once_with(
+        ACTIVITY_ID, dl_fmt=Garmin.ActivityDownloadFormat.ORIGINAL
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fmt,enum_attr", [
+    ("gpx", "GPX"),
+    ("tcx", "TCX"),
+    ("csv", "CSV"),
+])
+async def test_download_activity_file_other_formats_write_raw_bytes(
+    app_with_activity_analysis, mock_garmin_client, tmp_path, fmt, enum_attr
+):
+    from garminconnect import Garmin
+
+    payload = f"<{fmt}>data</{fmt}>".encode()
+    mock_garmin_client.download_activity.return_value = payload
+
+    result = await app_with_activity_analysis.call_tool(
+        "download_activity_file",
+        {"activity_id": ACTIVITY_ID, "format": fmt, "output_dir": str(tmp_path)},
+    )
+    data = json.loads(result[0][0].text)
+
+    expected = tmp_path / f"{ACTIVITY_ID}.{fmt}"
+    assert expected.read_bytes() == payload
+    assert data["format"] == fmt
+    mock_garmin_client.download_activity.assert_called_once_with(
+        ACTIVITY_ID, dl_fmt=getattr(Garmin.ActivityDownloadFormat, enum_attr)
+    )
+
+
+@pytest.mark.asyncio
+async def test_download_activity_file_invalid_format(
+    app_with_activity_analysis, mock_garmin_client, tmp_path
+):
+    result = await app_with_activity_analysis.call_tool(
+        "download_activity_file",
+        {"activity_id": ACTIVITY_ID, "format": "pdf", "output_dir": str(tmp_path)},
+    )
+    data = json.loads(result[0][0].text)
+
+    assert "Invalid format" in data["error"]
+    assert "fit" in data["valid_formats"]
+    mock_garmin_client.download_activity.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_download_activity_file_needs_setup(
+    app_with_activity_analysis, mock_garmin_client, monkeypatch, tmp_path
+):
+    monkeypatch.delenv("GARMIN_FIT_DOWNLOAD_DIR", raising=False)
+    monkeypatch.setenv("GARMIN_FIT_CONFIG", str(tmp_path / "missing.json"))
+
+    result = await app_with_activity_analysis.call_tool(
+        "download_activity_file", {"activity_id": ACTIVITY_ID}
+    )
+    data = json.loads(result[0][0].text)
+
+    assert data["status"] == "needs_setup"
+    assert "suggested_default" in data
+    mock_garmin_client.download_activity.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_download_activity_file_none_response(
+    app_with_activity_analysis, mock_garmin_client, tmp_path
+):
+    mock_garmin_client.download_activity.return_value = None
+
+    result = await app_with_activity_analysis.call_tool(
+        "download_activity_file",
+        {"activity_id": ACTIVITY_ID, "output_dir": str(tmp_path)},
+    )
+    text = result[0][0].text
+
+    assert "No fit data returned" in text
+
+
+@pytest.mark.asyncio
+async def test_download_activity_file_fit_extraction_failure(
+    app_with_activity_analysis, mock_garmin_client, tmp_path
+):
+    # A ZIP with no .fit entry makes _extract_fit_bytes raise; the tool should
+    # return a debug JSON payload and write nothing.
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("notes.txt", b"no fit here")
+    mock_garmin_client.download_activity.return_value = buf.getvalue()
+
+    result = await app_with_activity_analysis.call_tool(
+        "download_activity_file",
+        {"activity_id": ACTIVITY_ID, "output_dir": str(tmp_path)},
+    )
+    data = json.loads(result[0][0].text)
+
+    assert "error" in data
+    assert "first_16_bytes_hex" in data["debug"]
+    assert not (tmp_path / f"{ACTIVITY_ID}.fit").exists()

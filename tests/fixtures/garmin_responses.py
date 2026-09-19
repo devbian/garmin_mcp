@@ -11,6 +11,7 @@ MOCK_ACTIVITIES = [
         "activityId": 12345678901,
         "activityName": "Morning Run",
         "activityType": {"typeKey": "running", "typeId": 1},
+        "eventType": {"typeKey": "race", "typeId": 1},  # production values: "race", "training", "uncategorized"
         "startTimeLocal": "2024-01-15 07:00:00",
         "distance": 5000.0,
         "duration": 1800.0,
@@ -24,6 +25,7 @@ MOCK_ACTIVITIES = [
         "activityId": 12345678902,
         "activityName": "Cycling",
         "activityType": {"typeKey": "cycling", "typeId": 2},
+        "eventType": {"typeKey": "training", "typeId": 6},
         "startTimeLocal": "2024-01-14 16:00:00",
         "distance": 20000.0,
         "duration": 3600.0,
@@ -36,7 +38,10 @@ MOCK_ACTIVITIES = [
 MOCK_ACTIVITY_DETAILS = {
     "activityId": 12345678901,
     "activityName": "Morning Run",
+    "description": "Felt strong throughout. New shoes.",
     "activityType": {"typeKey": "running", "typeId": 1},
+    "activityTypeDTO": {"typeKey": "running", "typeId": 1, "parentTypeId": 17},
+    "eventTypeDTO": {"typeKey": "race", "typeId": 1, "sortOrder": 5},
     "startTimeLocal": "2024-01-15 07:00:00",
     "distance": 5000.0,
     "duration": 1800.0,
@@ -265,15 +270,35 @@ MOCK_FLOORS = {
 }
 
 MOCK_TRAINING_STATUS = {
-    "trainingStatusKey": "PRODUCTIVE",
-    "load7Day": 250,
-    "load4Week": 1000,
-    "trainingEffectLabel": "MAINTAINING",
-    "vo2MaxValue": 52.5,
-    "vo2MaxPrecisionIndex": 1.0,
-    "fitnessAge": 25,
-    "lactateThresholdHeartRate": 165,
-    "lactateThresholdSpeed": 3.5
+    "mostRecentTrainingStatus": {
+        "latestTrainingStatusData": {
+            "device-123456": {
+                "calendarDate": "2024-01-15",
+                "trainingStatus": "PRODUCTIVE",
+                "trainingStatusFeedbackPhrase": "MAINTAINING",
+                "sport": "RUNNING",
+                "fitnessTrend": "INCREASING",
+                "acuteTrainingLoadDTO": {
+                    "dailyTrainingLoadAcute": 250,
+                    "dailyTrainingLoadChronic": 220,
+                    "dailyAcuteChronicWorkloadRatio": 1.14,
+                    "acwrStatus": "OPTIMAL",
+                    "acwrPercent": 75,
+                },
+            }
+        }
+    },
+    "mostRecentVO2Max": {
+        "generic": {
+            "vo2MaxValue": 52.5,
+            "vo2MaxPreciseValue": 52.47,
+        },
+        "cycling": {
+            "vo2MaxValue": 55.0,
+            "vo2MaxPreciseValue": 55.12,
+        },
+    },
+    "mostRecentTrainingLoadBalance": {},
 }
 
 MOCK_RHR_DAY = {
@@ -567,6 +592,19 @@ MOCK_GEAR = [
         "dateEnd": "2024-04-01T19:14:05.0",
         "maximumMeters": 700000.0,
         "notified": True,
+    },
+]
+
+# Gear notes are exposed by Garmin's v2 endpoint, whose UUIDs are hyphenated.
+MOCK_GEAR_V2 = [
+    {
+        "uuid": "8ABFC40D-71FB-4860-BCE1-9072B6C79644",
+        "name": "Nimbus 25",
+        "notes": "Rotation shoe; blue laces.",
+    },
+    {
+        "uuid": "6f27ed27-3977-49ac-9f6f-450e039c2424",
+        "name": "Nimbus 24",
     },
 ]
 
@@ -947,3 +985,61 @@ MOCK_CYCLING_FTP = {
     "functionalThresholdPower": 294,
     "biometricSourceType": "CHANGE_LOG",
 }
+
+# Training - Running Tolerance
+# All three load fields are in meters despite the name — acuteImpactLoad is an
+# intensity-adjusted distance-equivalent, not an arbitrary load score.
+MOCK_RUNNING_TOLERANCE_DAILY = [
+    {
+        "userProfilePK": 12345678,
+        "calendarDate": "2024-01-15",
+        "acuteImpactLoad": 25000,
+        "acuteDistance": 22000,
+        "acuteTolerance": 34000,
+        "runningToleranceFeedBackPhrase": "MEDIUM_LOAD",
+    }
+]
+
+# Deliberately out of chronological order — the real API returns daily
+# aggregation this way, so the trend tool must sort it itself.
+MOCK_RUNNING_TOLERANCE_DAILY_TREND = [
+    {
+        "userProfilePK": 12345678,
+        "calendarDate": "2024-01-16",
+        "acuteImpactLoad": 26000,
+        "acuteDistance": 23000,
+        "acuteTolerance": 34500,
+        "runningToleranceFeedBackPhrase": "MEDIUM_LOAD",
+    },
+    {
+        "userProfilePK": 12345678,
+        "calendarDate": "2024-01-15",
+        "acuteImpactLoad": 25000,
+        "acuteDistance": 22000,
+        "acuteTolerance": 34000,
+        "runningToleranceFeedBackPhrase": "MEDIUM_LOAD",
+    },
+]
+
+MOCK_RUNNING_TOLERANCE_WEEKLY = [
+    {
+        "userProfilePK": 12345678,
+        "calendarDate": "2024-01-08",
+        "totalImpactLoad": 26000,
+        "totalDistance": 24000.0,
+        "tolerance": 33000,
+        "startOfWeek": "2024-01-02",
+        "endOfWeek": "2024-01-08",
+        "weekIndex": 1900,
+    },
+    {
+        "userProfilePK": 12345678,
+        "calendarDate": "2024-01-15",
+        "totalImpactLoad": 28000,
+        "totalDistance": 26000.0,
+        "tolerance": 34000,
+        "startOfWeek": "2024-01-09",
+        "endOfWeek": "2024-01-15",
+        "weekIndex": 1901,
+    },
+]

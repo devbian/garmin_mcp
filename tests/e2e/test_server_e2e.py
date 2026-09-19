@@ -13,10 +13,10 @@ Run with: pytest tests/e2e/ -m e2e
 Or skip with: pytest -m "not e2e"
 """
 
-import pytest
-import asyncio
 import os
 import sys
+import pytest
+import asyncio
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
@@ -29,12 +29,19 @@ from mcp.client.stdio import stdio_client
 load_dotenv()
 
 
-def server_params() -> StdioServerParameters:
-    """Start the server with the same interpreter running the tests."""
+def _build_server_params():
+    """Construct MCP server parameters using the active Python interpreter."""
+    env = os.environ.copy()
+    repo_root = Path(__file__).resolve().parents[2]
+    src_path = repo_root / "src"
+    if str(src_path) not in env.get("PYTHONPATH", ""):
+        env["PYTHONPATH"] = os.pathsep.join(
+            filter(None, [str(src_path), env.get("PYTHONPATH", "")])
+        )
     return StdioServerParameters(
         command=sys.executable,
         args=["-m", "garmin_mcp"],
-        env=dict(os.environ),
+        env=env,
     )
 
 
@@ -50,7 +57,7 @@ async def test_mcp_server_connection():
     - May require MFA code input if tokens are expired
     """
     # Use python module execution instead of direct script path
-    params = server_params()
+    params = _build_server_params()
 
     # Connect to server with timeout
     try:
@@ -84,7 +91,7 @@ async def test_mcp_server_connection():
 @pytest.mark.timeout(30)
 async def test_list_activities_tool():
     """Test the list_activities MCP tool with real API"""
-    params = server_params()
+    params = _build_server_params()
 
     try:
         async with asyncio.timeout(20):
@@ -114,7 +121,7 @@ async def test_list_activities_tool():
 @pytest.mark.timeout(30)
 async def test_get_steps_data_tool():
     """Test the get_steps_data MCP tool with real API"""
-    params = server_params()
+    params = _build_server_params()
 
     try:
         async with asyncio.timeout(20):
@@ -146,7 +153,7 @@ async def test_get_steps_data_tool():
 @pytest.mark.timeout(45)
 async def test_multiple_tools():
     """Test multiple MCP tools in a single session"""
-    params = server_params()
+    params = _build_server_params()
 
     try:
         async with asyncio.timeout(40):
@@ -197,7 +204,7 @@ async def test_schedule_workouts_tool():
     import os
     import json
 
-    params = server_params()
+    params = _build_server_params()
 
     workout_ids_env = os.environ.get("GARMIN_TEST_WORKOUT_IDS", "")
     dates_env = os.environ.get("GARMIN_TEST_SCHEDULE_DATES", "")
@@ -256,11 +263,7 @@ async def test_upload_workouts_tool():
     """
     import json
 
-    server_params = StdioServerParameters(
-        command="python",
-        args=["-m", "garmin_mcp"],
-        env=None,
-    )
+    server_params = _build_server_params()
 
     minimal_workout = {
         "workoutName": "e2e Test Workout - DELETE ME",
@@ -334,11 +337,7 @@ async def test_delete_workouts_tool():
     """
     import json
 
-    server_params = StdioServerParameters(
-        command="python",
-        args=["-m", "garmin_mcp"],
-        env=None,
-    )
+    server_params = _build_server_params()
 
     try:
         async with asyncio.timeout(50):
@@ -384,11 +383,7 @@ async def test_schedule_workouts_inline_upload():
     """
     import json
 
-    server_params = StdioServerParameters(
-        command="python",
-        args=["-m", "garmin_mcp"],
-        env=None,
-    )
+    server_params = _build_server_params()
 
     inline_workout = {
         "workoutName": "e2e Inline Test - DELETE ME",
@@ -462,11 +457,7 @@ async def test_schedule_workouts_missing_required_fields():
     """
     import json
 
-    server_params = StdioServerParameters(
-        command="python",
-        args=["-m", "garmin_mcp"],
-        env=None,
-    )
+    server_params = _build_server_params()
 
     try:
         async with asyncio.timeout(50):

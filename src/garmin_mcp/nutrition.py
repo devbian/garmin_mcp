@@ -1,9 +1,10 @@
 """
 Nutrition/food logging functions for Garmin Connect MCP Server
 """
+import datetime
 import json
+from copy import deepcopy
 from typing import Optional
-from urllib.parse import quote
 
 from garminconnect import GarminConnectConnectionError
 
@@ -48,6 +49,76 @@ def register_tools(app):
             return f"Error retrieving food log data: {str(e)}"
 
     @app.tool()
+    async def get_nutrition_summary_between_dates(start_date: str, end_date: str) -> str:
+        """Get per-day nutrition totals for every day in a date range.
+
+        Returns one lightweight entry per day (date, calories, carbs, protein,
+        fat, item_count) instead of the full per-item food log that
+        get_nutrition_daily_food_log returns for a single date. Use this for
+        multi-day intake analysis (e.g. mean intake for a TDEE estimate)
+        instead of calling get_nutrition_daily_food_log once per day.
+
+        item_count is the number of logged food items that day. A day with
+        item_count == 0 has no logged food at all, and a low but nonzero
+        item_count may mean only part of the day was logged (e.g. breakfast
+        only). Both cases read as low intake in the totals alone -- exclude
+        low-item_count days explicitly before averaging intake or deriving
+        TDEE; don't infer "unlogged" from a low calorie total.
+
+        Maximum range: 61 days per call (Garmin's own limit for this endpoint).
+
+        Args:
+            start_date: Start date in YYYY-MM-DD format
+            end_date: End date in YYYY-MM-DD format
+        """
+        MAX_DAYS = 61
+        try:
+            start = datetime.date.fromisoformat(start_date)
+            end = datetime.date.fromisoformat(end_date)
+        except ValueError as e:
+            return f"Invalid date format: {e}. Use YYYY-MM-DD."
+
+        days = (end - start).days + 1
+        if days < 1:
+            return "end_date must be on or after start_date."
+        if days > MAX_DAYS:
+            return f"Date range too large ({days} days). Maximum is {MAX_DAYS} days."
+
+        try:
+            data = garmin_client.connectapi(
+                "/nutrition-service/food/logs/range",
+                params={"startDate": start_date, "endDate": end_date},
+            )
+        except Exception as e:
+            return f"Error retrieving nutrition summary: {str(e)}"
+
+        summaries = (data or {}).get("dailyNutritionSummaries") or []
+        if not summaries:
+            return f"No nutrition data found between {start_date} and {end_date}."
+
+        daily = []
+        for day in summaries:
+            content = day.get("dailyNutritionContent") or {}
+            item_count = sum(
+                len(meal.get("loggedFoods") or [])
+                for meal in (day.get("mealDetails") or [])
+            )
+            daily.append({
+                "date": day.get("mealDate"),
+                "calories": content.get("calories"),
+                "carbs": content.get("carbs"),
+                "protein": content.get("protein"),
+                "fat": content.get("fat"),
+                "item_count": item_count,
+            })
+
+        return json.dumps({
+            "start_date": start_date,
+            "end_date": end_date,
+            "days": daily,
+        }, indent=2)
+
+    @app.tool()
     async def get_nutrition_daily_meals(date: str) -> str:
         """Get daily meal summaries for a date
 
@@ -87,6 +158,151 @@ def register_tools(app):
             return f"Error retrieving nutrition settings: {str(e)}"
 
     @app.tool()
+    async def set_nutrition_daily_settings(
+        date: str,
+        calorie_goal: Optional[int] = None,
+        carbs_grams: Optional[int] = None,
+        fat_grams: Optional[int] = None,
+        protein_grams: Optional[int] = None,
+    ) -> str:
+        """Update daily nutrition goals (calorie target and macronutrient targets).
+
+        Reads the current settings for the date, applies the supplied overrides,
+        and writes the merged result back.  Only the fields you provide are
+        changed; omitted fields keep their existing values.
+
+        Macro arguments retain their existing names and are passed through to
+        Garmin's macroGoals without unit conversion. The endpoint's macro units
+        have not been independently verified. Returned goals come from Garmin's
+        response, or a settings read-back when the update has no response body.
+
+        Args:
+            date: Date in YYYY-MM-DD format (settings are typically set once and
+                  inherited across days, but Garmin accepts per-day overrides)
+            calorie_goal: Daily calorie target in kcal
+            carbs_grams: Daily carbohydrate target in grams
+            fat_grams: Daily fat target in grams
+            protein_grams: Daily protein target in grams
+        """
+        if all(v is None for v in (calorie_goal, carbs_grams, fat_grams, protein_grams)):
+            return "No fields to update — supply at least one of calorie_goal, carbs_grams, fat_grams, protein_grams."
+        try:
+            url = f"/nutrition-service/settings/{date}"
+            current = garmin_client.connectapi(url)
+            if not current:
+                return f"Could not read current nutrition settings for {date} — cannot apply update."
+            current = deepcopy(current)
+            if calorie_goal is not None:
+                current["calorieGoal"] = calorie_goal
+            macro_overrides = {
+                "carbs": carbs_grams,
+                "fat": fat_grams,
+                "protein": protein_grams,
+            }
+            if any(value is not None for value in macro_overrides.values()):
+                macros = current.get("macroGoals")
+                if macros is None:
+                    macros = {}
+                if not isinstance(macros, dict):
+                    return "Could not read current macro goals — cannot apply update."
+                macros.update({key: value for key, value in macro_overrides.items() if value is not None})
+                current["macroGoals"] = macros
+            resp = garmin_client.client.put("connectapi", url, json=current, api=True)
+            result = resp
+            if not result:
+                try:
+                    result = garmin_client.connectapi(url)
+                except Exception as e:
+                    return f"Nutrition update submitted, but could not verify stored settings: {e}"
+            if not isinstance(result, dict) or not result:
+                return "Nutrition update submitted, but could not verify stored settings."
+            result_macros = result.get("macroGoals") or {}
+            return json.dumps({
+                "status": "updated",
+                "date": date,
+                "calorie_goal": result.get("calorieGoal"),
+                "carbs_grams": result_macros.get("carbs"),
+                "fat_grams": result_macros.get("fat"),
+                "protein_grams": result_macros.get("protein"),
+            }, indent=2)
+        except Exception as e:
+            return f"Error updating nutrition settings: {str(e)}"
+
+    @app.tool()
+    async def search_foods(
+        query: str,
+        start: int = 0,
+        limit: int = 20,
+    ) -> str:
+        """Search Garmin's general food catalog (FatSecret + Garmin custom foods)
+
+        Searches across the entire food catalog including FatSecret-sourced
+        branded and generic foods, not just the user's Garmin custom foods.
+        Use this to find branded packaged foods by name before logging them.
+
+        Returns food_id, source, name, brand, and all available servings with
+        macros. The source field ("FATSECRET" or "GARMIN") and food_id together
+        identify the right routing for log_custom_food — pass both to
+        log_custom_food's food_id and source parameters respectively.
+
+        For the user's own custom foods only, use get_custom_foods instead.
+
+        Args:
+            query: Food name or brand to search for (e.g. "Cheerios", "Greek yogurt")
+            start: Starting index for pagination (default 0)
+            limit: Maximum number of results per page (default 20)
+        """
+        try:
+            data = garmin_client.connectapi(
+                "/nutrition-service/food/search",
+                params={"searchExpression": query, "start": start, "limit": limit},
+            )
+            if not data:
+                return "No foods found."
+
+            raw_results = data.get("results", []) if isinstance(data, dict) else []
+            has_more = bool(data.get("moreDataAvailable", False)) if isinstance(data, dict) else False
+
+            results = []
+            for item in raw_results:
+                meta = item.get("foodMetaData", {})
+                servings = []
+                for s in item.get("nutritionContents", []):
+                    serving: dict = {
+                        "serving_id": s.get("servingId"),
+                        "serving_unit": s.get("servingUnit"),
+                        "number_of_units": s.get("numberOfUnits"),
+                        "calories": s.get("calories"),
+                        "carbs_g": s.get("carbs"),
+                        "protein_g": s.get("protein"),
+                        "fat_g": s.get("fat"),
+                        "fiber_g": s.get("fiber"),
+                        "sodium_mg": s.get("sodium"),
+                    }
+                    servings.append({k: v for k, v in serving.items() if v is not None})
+
+                entry: dict = {
+                    "food_id": meta.get("foodId"),
+                    "name": meta.get("foodName"),
+                    "food_type": meta.get("foodType"),
+                    "source": meta.get("source"),
+                    "region": meta.get("regionCode"),
+                    "language": meta.get("languageCode"),
+                    "servings": servings,
+                }
+                if meta.get("brandName"):
+                    entry["brand"] = meta["brandName"]
+                results.append({k: v for k, v in entry.items() if v is not None})
+
+            return json.dumps({
+                "count": len(results),
+                "has_more": has_more,
+                "results": results,
+            }, indent=2)
+        except Exception as e:
+            return f"Error searching foods: {str(e)}"
+
+    @app.tool()
     async def get_custom_foods(
         search: str = "",
         start: int = 0,
@@ -98,19 +314,23 @@ def register_tools(app):
         to find existing foods by name before creating duplicates — the
         response includes foodId and servingId needed for log_custom_food.
 
+        For branded catalog foods (FatSecret), use search_foods instead.
+
         Args:
             search: Search term to filter foods by name (default: list all)
             start: Starting index for pagination (default 0)
             limit: Maximum number of results (default 20)
         """
         try:
-            url = (
-                f"/nutrition-service/customFood"
-                f"?searchExpression={quote(search)}"
-                f"&start={start}&limit={limit}"
-                f"&includeContent=true"
+            data = garmin_client.connectapi(
+                "/nutrition-service/customFood",
+                params={
+                    "searchExpression": search,
+                    "start": start,
+                    "limit": limit,
+                    "includeContent": "true",
+                },
             )
-            data = garmin_client.connectapi(url)
             if not data:
                 return "No custom foods found."
             return json.dumps(data, indent=2)
@@ -139,6 +359,7 @@ def register_tools(app):
         calories: float,
         serving_unit: str = "G",
         number_of_units: float = 100,
+        brand_name: Optional[str] = None,
         carbs: Optional[float] = None,
         protein: Optional[float] = None,
         fat: Optional[float] = None,
@@ -148,6 +369,10 @@ def register_tools(app):
         sodium: Optional[float] = None,
         cholesterol: Optional[float] = None,
         potassium: Optional[float] = None,
+        trans_fat: Optional[float] = None,
+        calcium: Optional[float] = None,
+        iron: Optional[float] = None,
+        vitamin_d: Optional[float] = None,
     ) -> str:
         """Create a custom food in the user's Garmin nutrition library
 
@@ -156,11 +381,16 @@ def register_tools(app):
         log_custom_food. If the API returns no data (204), use
         get_custom_foods(search=food_name) to retrieve those IDs.
 
+        All nutrient amounts are ABSOLUTE values per serving, not %DV.
+        Nutrition labels often print %DV for calcium/iron/vitamin D —
+        convert to absolute units before passing.
+
         Args:
             food_name: Name of the custom food (e.g. "Homemade Chocolate Cookies")
             calories: Calories per serving
             serving_unit: Unit for serving size (e.g. "G", "ML", "OZ"). Default "G"
             number_of_units: Serving size in the specified unit. Default 100
+            brand_name: Brand or vendor name (e.g. "Three Bridges")
             carbs: Carbohydrates in grams per serving
             protein: Protein in grams per serving
             fat: Total fat in grams per serving
@@ -170,6 +400,10 @@ def register_tools(app):
             sodium: Sodium in mg per serving
             cholesterol: Cholesterol in mg per serving
             potassium: Potassium in mg per serving
+            trans_fat: Trans fat in grams per serving
+            calcium: Calcium in mg per serving (NOT %DV)
+            iron: Iron in mg per serving (NOT %DV)
+            vitamin_d: Vitamin D in mcg per serving (NOT %DV)
         """
         try:
             nutrition = {
@@ -188,28 +422,36 @@ def register_tools(app):
                 "sodium": sodium,
                 "cholesterol": cholesterol,
                 "potassium": potassium,
+                "transFat": trans_fat,
+                "calcium": calcium,
+                "iron": iron,
+                "vitaminD": vitamin_d,
             }
             for key, value in optional_fields.items():
                 if value is not None:
                     nutrition[key] = _num_to_str(value)
 
+            food_meta: dict = {
+                "foodName": food_name,
+                "foodType": "GENERIC",
+                "source": "GARMIN",
+                "regionCode": "US",
+                "languageCode": "en",
+            }
+            if brand_name is not None:
+                food_meta["brandName"] = brand_name
+
             payload = {
-                "foodMetaData": {
-                    "foodName": food_name,
-                    "foodType": "GENERIC",
-                    "source": "GARMIN",
-                    "regionCode": "US",
-                    "languageCode": "en",
-                },
+                "foodMetaData": food_meta,
                 "nutritionContents": [nutrition],
             }
             url = "/nutrition-service/customFood"
             resp = garmin_client.client.put(
                 "connectapi", url, json=payload, api=True
             )
-            if resp.status_code == 204:
+            if not resp:
                 return "Custom food created (no response data returned)."
-            return json.dumps(resp.json(), indent=2)
+            return json.dumps(resp, indent=2)
         except GarminConnectConnectionError as e:
             body = ""
             if hasattr(e, "error") and hasattr(e.error, "response"):
@@ -226,6 +468,7 @@ def register_tools(app):
         calories: float,
         serving_unit: str = "G",
         number_of_units: float = 100,
+        brand_name: Optional[str] = None,
         carbs: Optional[float] = None,
         protein: Optional[float] = None,
         fat: Optional[float] = None,
@@ -235,10 +478,22 @@ def register_tools(app):
         sodium: Optional[float] = None,
         cholesterol: Optional[float] = None,
         potassium: Optional[float] = None,
+        trans_fat: Optional[float] = None,
+        calcium: Optional[float] = None,
+        iron: Optional[float] = None,
+        vitamin_d: Optional[float] = None,
     ) -> str:
         """Update an existing custom food in the user's Garmin nutrition library
 
-        Modifies a custom food's name and/or nutritional information.
+        Fetches the food's current record before writing so that omitted optional
+        fields (brand, carbs, protein, fat, micros, etc.) preserve their existing
+        values rather than being cleared. Only the fields you explicitly pass are
+        changed; everything else is carried forward from the current record.
+
+        All nutrient amounts are ABSOLUTE values per serving, not %DV.
+        Nutrition labels often print %DV for calcium/iron/vitamin D —
+        convert to absolute units before passing.
+
         Use get_custom_foods first to find the foodId and servingId.
 
         Args:
@@ -248,6 +503,7 @@ def register_tools(app):
             calories: Calories per serving
             serving_unit: Unit for serving size (e.g. "G", "ML", "OZ"). Default "G"
             number_of_units: Serving size in the specified unit. Default 100
+            brand_name: Brand or vendor name; omit to preserve the existing value
             carbs: Carbohydrates in grams per serving
             protein: Protein in grams per serving
             fat: Total fat in grams per serving
@@ -257,15 +513,36 @@ def register_tools(app):
             sodium: Sodium in mg per serving
             cholesterol: Cholesterol in mg per serving
             potassium: Potassium in mg per serving
+            trans_fat: Trans fat in grams per serving
+            calcium: Calcium in mg per serving (NOT %DV)
+            iron: Iron in mg per serving (NOT %DV)
+            vitamin_d: Vitamin D in mcg per serving (NOT %DV)
         """
         try:
-            nutrition = {
-                "servingId": serving_id,
-                "servingUnit": serving_unit,
-                "numberOfUnits": _num_to_str(number_of_units),
-                "calories": _num_to_str(calories),
-            }
-            optional_fields = {
+            # Fetch current record so omitted fields are preserved (not wiped).
+            existing_nutrition: dict = {}
+            existing_brand: Optional[str] = None
+            try:
+                search_data = garmin_client.connectapi(
+                    "/nutrition-service/customFood",
+                    params={
+                        "searchExpression": food_name,
+                        "start": 0,
+                        "limit": 20,
+                        "includeContent": "true",
+                    },
+                )
+                foods = search_data.get("customFoods", []) if isinstance(search_data, dict) else []
+                for f in foods:
+                    if str(f.get("foodMetaData", {}).get("foodId", "")) == food_id:
+                        existing_nutrition = (f.get("nutritionContents") or [{}])[0]
+                        existing_brand = f.get("foodMetaData", {}).get("brandName")
+                        break
+            except Exception:
+                pass  # proceed without existing data; caller's values win
+
+            # API field name → optional param value (None means "not supplied by caller")
+            optional_updates = {
                 "carbs": carbs,
                 "protein": protein,
                 "fat": fat,
@@ -275,29 +552,51 @@ def register_tools(app):
                 "sodium": sodium,
                 "cholesterol": cholesterol,
                 "potassium": potassium,
+                "transFat": trans_fat,
+                "calcium": calcium,
+                "iron": iron,
+                "vitaminD": vitamin_d,
             }
-            for key, value in optional_fields.items():
+            nutrition: dict = {
+                "servingId": serving_id,
+                "servingUnit": serving_unit,
+                "numberOfUnits": _num_to_str(number_of_units),
+                "calories": _num_to_str(calories),
+            }
+            # Carry forward existing optional fields, then overlay caller-supplied values.
+            preserved_keys = set(optional_updates.keys())
+            for key, existing_val in existing_nutrition.items():
+                if key in preserved_keys and existing_val is not None:
+                    nutrition[key] = _num_to_str(existing_val)
+            for key, value in optional_updates.items():
                 if value is not None:
                     nutrition[key] = _num_to_str(value)
 
+            # Effective brand: caller-supplied wins, else preserve existing, else omit.
+            effective_brand = brand_name if brand_name is not None else existing_brand
+
+            food_meta: dict = {
+                "foodId": food_id,
+                "foodName": food_name,
+                "foodType": "GENERIC",
+                "source": "GARMIN",
+                "regionCode": "US",
+                "languageCode": "en",
+            }
+            if effective_brand is not None:
+                food_meta["brandName"] = effective_brand
+
             payload = {
-                "foodMetaData": {
-                    "foodId": food_id,
-                    "foodName": food_name,
-                    "foodType": "GENERIC",
-                    "source": "GARMIN",
-                    "regionCode": "US",
-                    "languageCode": "en",
-                },
+                "foodMetaData": food_meta,
                 "nutritionContents": [nutrition],
             }
             url = "/nutrition-service/customFood"
             resp = garmin_client.client.put(
                 "connectapi", url, json=payload, api=True
             )
-            if resp.status_code == 204:
+            if not resp:
                 return "Custom food updated (no response data returned)."
-            return json.dumps(resp.json(), indent=2)
+            return json.dumps(resp, indent=2)
         except GarminConnectConnectionError as e:
             body = ""
             if hasattr(e, "error") and hasattr(e.error, "response"):
@@ -307,30 +606,66 @@ def register_tools(app):
             return f"Error updating custom food: {str(e)}"
 
     @app.tool()
+    async def delete_custom_food(food_id: str) -> str:
+        """Delete a custom food from the user's Garmin nutrition library
+
+        Permanently removes a custom food entry. The food must not be
+        actively referenced in a logged meal to be deleted.
+        Use get_custom_foods to find the foodId.
+
+        Args:
+            food_id: ID of the custom food to delete — a 32-char hex string
+                (from get_custom_foods or create_custom_food)
+        """
+        try:
+            url = f"/nutrition-service/customFood/{food_id}"
+            garmin_client.client.delete("connectapi", url, api=True)
+            return json.dumps(
+                {"status": "success", "food_id": food_id,
+                 "message": f"Custom food {food_id} deleted successfully."},
+                indent=2,
+            )
+        except GarminConnectConnectionError as e:
+            body = ""
+            if hasattr(e, "error") and hasattr(e.error, "response"):
+                body = getattr(e.error.response, "text", "")
+            return f"Error deleting custom food: {e} | Response: {body}"
+        except Exception as e:
+            return f"Error deleting custom food: {str(e)}"
+
+    @app.tool()
     async def log_custom_food(
         meal_date: str,
         meal_time: str,
         food_id: str,
         serving_id: str,
         serving_qty: float = 1,
+        source: str = "GARMIN",
     ) -> str:
-        """Log a custom food item to a meal on a date
+        """Log a food item to a meal on a date
 
-        Adds a food entry from the user's custom food library to the nutrition
-        log. The meal is determined automatically by matching meal_time against
-        each meal's startTime/endTime window; falls back to SNACKS if no window
-        matches.
+        Adds a food entry to the nutrition log. The meal is determined
+        automatically by matching meal_time against each meal's
+        startTime/endTime window; falls back to SNACKS if no window matches.
 
-        Use get_custom_foods (with the search parameter) to find existing foods
-        and retrieve their foodId and servingId. Alternatively, create a new
-        food with create_custom_food first.
+        Food sources:
+          - "GARMIN" (default): user's custom food library. Use
+            get_custom_foods to find food_id and serving_id.
+          - "FATSECRET": branded/catalog food from FatSecret. Use
+            search_foods to find food_id and serving_id. Pass the source
+            value from the search_foods result (e.g. "FATSECRET").
+
+        Garmin custom food IDs are 32-char hex UUIDs; FatSecret IDs are
+        numeric strings (e.g. "4132350"). Passing the wrong source for a
+        given food_id returns a 400 from Garmin.
 
         Args:
             meal_date: Date in YYYY-MM-DD format
             meal_time: Time in HH:MM:SS format (e.g. "12:30:00", account timezone)
-            food_id: Food ID from get_custom_foods or create_custom_food
-            serving_id: Serving ID from get_custom_foods or create_custom_food
+            food_id: Food ID from get_custom_foods (GARMIN) or search_foods (FATSECRET)
+            serving_id: Serving ID from get_custom_foods or search_foods
             serving_qty: Number of servings (default 1)
+            source: Food namespace — "GARMIN" (default) or "FATSECRET"
         """
         try:
             from datetime import datetime, timezone
@@ -367,7 +702,7 @@ def register_tools(app):
                         "mealId": meal_id,
                         "foodId": food_id,
                         "servingId": serving_id,
-                        "source": "GARMIN",
+                        "source": source,
                         "regionCode": "US",
                         "languageCode": "en",
                         "servingQty": serving_qty,
@@ -378,9 +713,9 @@ def register_tools(app):
             resp = garmin_client.client.put(
                 "connectapi", url, json=payload, api=True
             )
-            if resp.status_code == 204:
+            if not resp:
                 return "Food logged successfully."
-            return json.dumps(resp.json(), indent=2)
+            return json.dumps(resp, indent=2)
         except GarminConnectConnectionError as e:
             body = ""
             if hasattr(e, "error") and hasattr(e.error, "response"):
@@ -461,9 +796,9 @@ def register_tools(app):
             resp = garmin_client.client.put(
                 "connectapi", url, json=payload, api=True
             )
-            if resp.status_code == 204:
+            if not resp:
                 return "Food logged successfully."
-            return json.dumps(resp.json(), indent=2)
+            return json.dumps(resp, indent=2)
         except GarminConnectConnectionError as e:
             body = ""
             if hasattr(e, "error") and hasattr(e.error, "response"):
@@ -473,22 +808,22 @@ def register_tools(app):
             return f"Error logging food: {str(e)}"
 
     @app.tool()
-    async def delete_food_log(log_id: int) -> str:
+    async def delete_food_log(log_id: str, meal_date: str) -> str:
         """Delete a food log entry
 
         Permanently removes a logged food item from the nutrition log.
-        Use get_nutrition_daily_food_log to find the logId of the entry
-        to delete.
+        Works for both QUICK_ADD and REGULAR_LOG entry types.
+        Use get_nutrition_daily_food_log to find the logId and date.
 
         Args:
-            log_id: Log entry ID to delete (from get_nutrition_daily_food_log)
+            log_id: Log entry ID to delete — a 32-char hex UUID
+                (from get_nutrition_daily_food_log)
+            meal_date: Date of the log entry in YYYY-MM-DD format
         """
         try:
-            url = f"/nutrition-service/food/logs/{log_id}"
-            resp = garmin_client.client.delete("connectapi", url, api=True)
-            if resp.status_code in (200, 204):
-                return json.dumps({"status": "success", "log_id": log_id, "message": f"Food log entry {log_id} deleted successfully."}, indent=2)
-            return json.dumps({"status": "failed", "log_id": log_id, "http_status": resp.status_code, "message": f"Failed to delete food log: HTTP {resp.status_code}"}, indent=2)
+            url = f"/nutrition-service/food/logs/{meal_date}"
+            garmin_client.client.delete("connectapi", url, json={"logIds": [log_id]}, api=True)
+            return json.dumps({"status": "success", "log_id": log_id, "message": f"Food log entry {log_id} deleted successfully."}, indent=2)
         except GarminConnectConnectionError as e:
             body = ""
             if hasattr(e, "error") and hasattr(e.error, "response"):
@@ -534,13 +869,16 @@ def register_tools(app):
             from datetime import datetime, timezone
 
             # 1. Search for existing custom food
-            search_url = (
-                f"/nutrition-service/customFood"
-                f"?searchExpression={quote(food_name)}"
-                f"&start=0&limit=10&includeContent=true"
+            search_data = garmin_client.connectapi(
+                "/nutrition-service/customFood",
+                params={
+                    "searchExpression": food_name,
+                    "start": 0,
+                    "limit": 10,
+                    "includeContent": "true",
+                },
             )
-            search_data = garmin_client.connectapi(search_url)
-            foods = search_data if isinstance(search_data, list) else []
+            foods = search_data.get("customFoods", []) if isinstance(search_data, dict) else []
 
             food_id = None
             serving_id = None
@@ -578,24 +916,25 @@ def register_tools(app):
                 create_resp = garmin_client.client.put(
                     "connectapi", "/nutrition-service/customFood", json=create_payload, api=True
                 )
-                if create_resp.status_code not in (200, 201, 204):
-                    return f"Error creating custom food: HTTP {create_resp.status_code}"
-                if create_resp.status_code in (200, 201):
-                    created = create_resp.json()
-                    meta = created.get("foodMetaData", created)
+                # api=True means create_resp is already a parsed dict; errors raise GarminConnectConnectionError.
+                if create_resp:  # non-empty: response body contains foodId/servingId
+                    meta = create_resp.get("foodMetaData", create_resp)
                     food_id = str(meta.get("foodId", ""))
-                    contents = created.get("nutritionContents", [])
+                    contents = create_resp.get("nutritionContents", [])
                     if contents:
                         serving_id = str(contents[0].get("servingId", ""))
                 # 204: no body — look up by name
                 if not food_id or not serving_id:
-                    lookup_url = (
-                        f"/nutrition-service/customFood"
-                        f"?searchExpression={quote(food_name)}"
-                        f"&start=0&limit=10&includeContent=true"
+                    lookup_data = garmin_client.connectapi(
+                        "/nutrition-service/customFood",
+                        params={
+                            "searchExpression": food_name,
+                            "start": 0,
+                            "limit": 10,
+                            "includeContent": "true",
+                        },
                     )
-                    lookup_data = garmin_client.connectapi(lookup_url)
-                    lookup_foods = lookup_data if isinstance(lookup_data, list) else []
+                    lookup_foods = lookup_data.get("customFoods", []) if isinstance(lookup_data, dict) else []
                     for f in lookup_foods:
                         meta = f.get("foodMetaData", f)
                         if meta.get("foodName", "").lower() == food_name.lower():
@@ -647,9 +986,9 @@ def register_tools(app):
             log_resp = garmin_client.client.put(
                 "connectapi", "/nutrition-service/food/logs", json=log_payload, api=True
             )
-            if log_resp.status_code == 204:
+            if not log_resp:
                 return "Food logged successfully."
-            return json.dumps(log_resp.json(), indent=2)
+            return json.dumps(log_resp, indent=2)
         except GarminConnectConnectionError as e:
             body = ""
             if hasattr(e, "error") and hasattr(e.error, "response"):
