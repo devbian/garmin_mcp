@@ -25,7 +25,7 @@ Garmin's API is accessed via the awesome [python-garminconnect](https://github.c
 
 ### Tool Coverage
 
-This MCP server implements **110+ tools** covering ~90% of the [python-garminconnect](https://github.com/cyberjunky/python-garminconnect) library (v0.3.2):
+This MCP server implements **110+ tools** using [python-garminconnect](https://github.com/cyberjunky/python-garminconnect) (v0.3.16):
 
 - ✅ Activity Management (20 tools) - includes write tools for type, description, event type, perceived effort, and feel
 - ✅ Health & Wellness (33 tools) - includes custom lightweight summary tools
@@ -342,7 +342,7 @@ uvx --python 3.12 --from git+https://github.com/Taxuspt/garmin_mcp garmin-mcp-au
 
 This saves OAuth tokens to `~/.garminconnect`. After that the server works without any credentials in the config.
 
-> **Note:** Tokens are valid for approximately 6 months. Re-run `garmin-mcp-auth` when they expire.
+> **Note:** DI tokens can refresh automatically. Re-run `garmin-mcp-auth` if the refresh token is revoked or expires. JWT_WEB-only tokens saved by older versions must be replaced with a fresh login.
 
 ### Build the `.dxt` yourself
 
@@ -1042,10 +1042,11 @@ Solution:
 
 **Token Expired**
 
-OAuth tokens expire periodically (approximately every 6 months). Re-authenticate:
+If stored tokens are rejected or only contain the older JWT_WEB session, re-authenticate:
 ```bash
 garmin-mcp-auth --force-reauth
 ```
+For Garmin China accounts, add `--is-cn` to this command and to token verification.
 
 **Verify Tokens Work**
 ```bash

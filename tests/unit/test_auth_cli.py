@@ -152,14 +152,12 @@ class TestAuthenticate:
 
     @patch("garmin_mcp.auth_cli.token_exists")
     @patch("garmin_mcp.auth_cli.get_credentials")
-    @patch("garmin_mcp.auth_cli.validate_tokens")
     @patch("garmin_mcp.auth_cli.Garmin")
     @patch("garmin_mcp.auth_cli._verify_saved_tokens", return_value=(True, "Test User"))
     @patch("garmin_mcp.auth_cli.os.chmod")
     def test_successful_authentication(self, mock_chmod, mock_verify, mock_garmin, mock_get_creds, mock_exists):
         """Test successful authentication flow."""
         mock_exists.return_value = False
-        mock_validate.return_value = (True, "")
         mock_get_creds.return_value = ("test@example.com", "secret")
 
         mock_garmin_instance = Mock()
@@ -455,14 +453,12 @@ class TestAuthenticateIsCn:
 
     @patch("garmin_mcp.auth_cli.token_exists")
     @patch("garmin_mcp.auth_cli.get_credentials")
-    @patch("garmin_mcp.auth_cli.validate_tokens")
     @patch("garmin_mcp.auth_cli.Garmin")
     @patch("garmin_mcp.auth_cli._verify_saved_tokens", return_value=(True, "Test User"))
     @patch("garmin_mcp.auth_cli.os.chmod")
     def test_authenticate_passes_is_cn_true(self, mock_chmod, mock_verify, mock_garmin, mock_get_creds, mock_exists):
         """Test that is_cn=True is passed to Garmin constructor."""
         mock_exists.return_value = False
-        mock_validate.return_value = (True, "")
         mock_get_creds.return_value = ("test@example.com", "secret")
 
         mock_garmin_instance = Mock()
@@ -487,14 +483,12 @@ class TestAuthenticateIsCn:
 
     @patch("garmin_mcp.auth_cli.token_exists")
     @patch("garmin_mcp.auth_cli.get_credentials")
-    @patch("garmin_mcp.auth_cli.validate_tokens")
     @patch("garmin_mcp.auth_cli.Garmin")
     @patch("garmin_mcp.auth_cli._verify_saved_tokens", return_value=(True, "Test User"))
     @patch("garmin_mcp.auth_cli.os.chmod")
     def test_authenticate_passes_is_cn_false(self, mock_chmod, mock_verify, mock_garmin, mock_get_creds, mock_exists):
         """Test that is_cn=False is passed to Garmin constructor by default."""
         mock_exists.return_value = False
-        mock_validate.return_value = (True, "")
         mock_get_creds.return_value = ("test@example.com", "secret")
 
         mock_garmin_instance = Mock()
